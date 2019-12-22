@@ -1,7 +1,7 @@
+#include <vmread/hlapi/hlapi.h>
 #include "m0dular/utils/handles.h"
-#include "../globals.h"
 
-ModuleInfo Handles::GetModuleInfo(const char *module)
+ModuleInfo Handles::GetModuleInfo(WinProcess *process, const char *module)
 {
     WinDll *moduleInfo = process->GetModuleInfo(module);
 
