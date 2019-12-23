@@ -24,6 +24,7 @@
 #include <errno.h>
 #include <fcntl.h>
 
+#include "PacketStructure.h"
 #include "Signatures.h"
 
 /* Some Networking code pasted from jxh: https://stackoverflow.com/questions/25091148/single-tcp-ip-server-that-handles-multiple-clients-in-c */
@@ -50,23 +51,20 @@ typedef std::chrono::high_resolution_clock Clock;
 
 static bool sigscanFailed = false;
 
-std::atomic<int> uniquePid = 1024;
+static WinContext *ctx;
 
 static void *ThreadSignature(const Signature *sig) {
     MTR_SCOPED_TRACE("Initialization", "ThreadedSignature");
-
-    pid_t pid = ++uniquePid;
 
     try{
         WinProcess *desiredProcess = nullptr;
         uintptr_t desiredModuleBase = 0;
         uintptr_t desiredModuleSize = 0;
 
-        WinContext ctx(pid);
 
-        ctx.processList.Refresh();
+        ctx->processList.Refresh();
 
-        for (auto &i : ctx.processList) {
+        for (auto &i : ctx->processList) {
             if (!strcasecmp(sig->processName, i.proc.name)) {
                 desiredProcess = &i;
 
@@ -112,21 +110,99 @@ static bool IsClosed( int sock ){
             case EWOULDBLOCK: break; /* empty rx queue */
             case ETIMEDOUT:   break; /* recv timeout */
             case ENOTCONN:    break; /* not connected yet */
-            default:          throw(errno);
+            case ECONNRESET:  break; /* connection reset by peer. (closed program) */
+            default:          Logger::Log("Connection Closed. Code(%d)\n", errno);
         }
     }
     return r == 0;
 }
 
-static void* NewConnection( void *rawArg ){
+static void* NewConnection( void *raw_NewSock ){
     ssize_t r;
-    int sock = *(int*)rawArg;
-    free( rawArg );
+    int sock = *(int*)raw_NewSock;
+    free( raw_NewSock );
 
-    Logger::Log("New Connection (%d)!\n", sock);
+    ReapRequestGeneric request;
+    ReapRequestGeneric response;
+    ReapOpenProcessRequest *openProcess;
+    ReapErrorReport error = ReapErrorReport();
+
+    WinProcess *process = nullptr;
+
+    Logger::Log("New Connection (%d). Waiting for message.\n", sock);
     while( !IsClosed(sock) && running ){
-        r = send(sock, "swag\n", 5, 0);
-        if( r < 0 ) break;
+        r = recv( sock, &request, sizeof(ReapRequestGeneric), 0 );
+        if( r < 0 ){
+            Logger::Log("Error receiving on open sock!(%d)\n", sock); // can happen when client alt-f4's
+            break;
+        } else if( r < sizeof(ReapPacketHeader) || ( strcmp( request.magic, "reap" ) != 0 ) ){
+            Logger::Log("Invalid pkt header!(%d)\n", sock);
+            r = snprintf( error.errorString, sizeof(error.errorString), "Invalid packet header.");
+            error.errorStringLen = r;
+            error.errorType = OperationType_t::PING;
+            send( sock, &error, sizeof( ReapErrorReport ), 0 );
+            continue;
+        } else if( request.version != REAP_VERSION ){
+            Logger::Log("Client version mismatch!(%d)\n", sock);
+            r = snprintf( error.errorString, sizeof(error.errorString), "Version Mismatch, please update.");
+            error.errorStringLen = r;
+            error.errorType = OperationType_t::PING;
+            send( sock, &error, sizeof( ReapErrorReport ), 0 );
+            continue;
+        } else {
+            switch( request.type ){
+                case OperationType_t::PING:
+                    Logger::Log("Received ping packet. Responding...\n");
+                    response.type = OperationType_t::PING;
+                    r = send( sock, &response, sizeof(ReapPacketHeader), 0 );
+                    break;
+                case OperationType_t::OPENPROCESS:
+                    process = nullptr;
+                    ctx->processList.Refresh();
+                    openProcess = (ReapOpenProcessRequest*)&request;
+
+                    Logger::Log("Opening process (%s) for (%d)\n", openProcess->processName, sock);
+
+                    for (auto &i : ctx->processList) {
+                        if (!strcasecmp(openProcess->processName, i.proc.name)) {
+                            Logger::Log("Found process (%s)\n", openProcess->processName);
+                            process = &i;
+                        }
+                    }
+                    if( !process ){
+                        r = snprintf( error.errorString, sizeof(error.errorString), "Failed to find your process." );
+                        error.errorStringLen = r;
+                        error.errorType = OperationType_t::OPENPROCESS;
+                        send( sock, &error, sizeof(ReapErrorReport), 0 );
+                    } else {
+                        openProcess = (ReapOpenProcessRequest*)&response;
+                        openProcess->type = OperationType_t::OPENPROCESS;
+                        snprintf( openProcess->processName, sizeof(openProcess->processName), "Process Set." ); // unnecessary, but why not
+                        send( sock, openProcess, sizeof( ReapOpenProcessRequest ), 0 );
+                    }
+                    break;
+                case OperationType_t::READPROCESSMEMORY:
+                    if( !process ){
+                        r = snprintf( error.errorString, sizeof(error.errorString), "You need to Open Process before you can read/write!");
+                        error.errorStringLen = r;
+                        error.errorType = OperationType_t::READPROCESSMEMORY;
+                        send( sock, &error, sizeof(ReapErrorReport), 0 );
+                    }
+                    break;
+                case OperationType_t::WRITEPROCESSMEMORY:
+                    if( !process ){
+                        r = snprintf( error.errorString, sizeof(error.errorString), "You need to Open Process before you can read/write!");
+                        error.errorStringLen = r;
+                        error.errorType = OperationType_t::WRITEPROCESSMEMORY;
+                        send( sock, &error, sizeof(ReapErrorReport), 0 );
+                    }
+
+                    break;
+                default:
+                    /// Send back invalid packet
+                    break;
+            }
+        }
         sleep(1);
     }
     Logger::Log("Connection Closed (%d)\n", sock);
@@ -137,13 +213,16 @@ static void* NewConnection( void *rawArg ){
 }
 
 static void *MainThread(void *) {
-    pid_t pid;
+    pid_t pid = getpid();
     int opt = true;
     int sock;
     int sockFlags;
     struct addrinfo hints = {};
     struct addrinfo *res = 0, *ai = 0, *ai_ipv4 = 0;
     int *newSock;
+
+    Threading::InitThreads();
+
 
 
 #if (LMODE() == MODE_EXTERNAL())
@@ -160,13 +239,20 @@ static void *MainThread(void *) {
     MTR_META_PROCESS_NAME("Reap");
 #endif
 
+    try{
+        ctx = new WinContext( pid );
+    } catch( VMException ex ){
+        Logger::Log("VmRead Context Init failed(%d). Stopping.\n", ex.value);
+        return nullptr;
+    }
+
     Logger::Log("Main Loaded.\n");
 
     hints.ai_family = PF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
     hints.ai_flags = AI_PASSIVE;
 
-    getaddrinfo( "0::0", "666", &hints, &res);
+    getaddrinfo( "0.0.0.0", "666", &hints, &res);
 
     for( ai = res; ai; ai = ai->ai_next ){
         if (ai->ai_family == PF_INET6) break;
@@ -205,51 +291,6 @@ static void *MainThread(void *) {
     // Ignore broken pipe signal from send(). Default behavior is to end the program.
     signal(SIGPIPE, SIG_IGN);
 
-    /*
-    Threading::InitThreads();
-    auto t1 = Clock::now();
-
-
-    MTR_BEGIN("Initialization", "InitCTX");
-    WinContext ctx(pid);
-    MTR_END("Initialization", "InitCTX");
-
-    MTR_BEGIN("Initialization", "FindProcesses");
-    ctx.processList.Refresh();
-    for (auto &i : ctx.processList) {
-        //Logger::Log("\nFound Process %s(PID:%ld)", i.proc.name, i.proc.pid);
-        if (!strcasecmp(PROCNAME, i.proc.name)) {
-            Logger::Log("\nFound Process %s(PID:%ld)", i.proc.name, i.proc.pid);
-            PEB peb = i.GetPeb();
-            short magic = i.Read<short>(peb.ImageBaseAddress);
-            uintptr_t translatedBase = VTranslate(&i.ctx->process, i.proc.dirBase, peb.ImageBaseAddress);
-            Logger::Log("\tWinBase:\t%p\tBase:\t%p\tQemuBase:\t%p\tMagic:\t%hx (valid: %hhx)\n", (void *) peb.ImageBaseAddress, (void *) i.proc.process,
-                        (void *) translatedBase,
-                        magic, (char) (magic == IMAGE_DOS_SIGNATURE));
-            process = &i;
-
-            for (auto &o : i.modules) {
-                if (!strcasecmp(MODNAME, o.info.name)) {
-                    Logger::Log("Found Module: (%s) - baseAddr(%p)\n", o.info.name, o.info.baseAddress);
-                } else if (!strcasecmp(PROCFULLNAME, o.info.name)) {
-                    Logger::Log("Found Module: (%s) - baseAddr(%p)\n", o.info.name, o.info.baseAddress);
-                }
-            }
-        }
-    }
-    MTR_END("Initialization", "FindProcesses");
-
-    if (!process) {
-        Logger::Log("Could not Find Process/Base. Exiting...\n");
-        goto quit;
-    }
-
-
-    auto t2 = Clock::now();
-    printf("Initialization time: %lld ms\n", (long long) std::chrono::duration_cast<std::chrono::milliseconds>(t2 - t1).count());
-    */
-
-
     Logger::Log("Main Loop Started. Waiting For Connections...\n");
 
 
@@ -277,6 +318,7 @@ static void *MainThread(void *) {
 
     quit:
     Logger::Log("Main Loop Ended.\n");
+    delete ctx;
     running = false;
 
     Threading::FinishQueue(true);

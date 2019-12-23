@@ -2,21 +2,50 @@
 
 #define REAP_VERSION 001
 
-enum class OperationType_t : uint16_t
+#include <cstdint>
+
+// All Packets are Bi-Directional except for ErrorReport
+
+enum OperationType_t : uint16_t
 {
+    PING = 0,
     OPENPROCESS = 1,
     WRITEPROCESSMEMORY = 2,
     READPROCESSMEMORY = 3,
+    ERRORREPORT = 4,
 };
 
-struct ReapRequest
+#define CASE_STRING( x ) case static_cast<int>( x ) : return #x
+
+static inline const char* Op2String(OperationType_t op){
+    switch (op) {
+        CASE_STRING(PING);
+        CASE_STRING(OPENPROCESS);
+        CASE_STRING(WRITEPROCESSMEMORY);
+        CASE_STRING(READPROCESSMEMORY);
+        CASE_STRING(ERRORREPORT);
+        default:
+            return "UNKNOWN";
+    }
+}
+struct ReapPacketHeader
 {
-    static const char magic[4] = "reap";
-    uint8_t version;
+    static constexpr char magic[5] = "reap";
+    static constexpr uint8_t version = REAP_VERSION;
     OperationType_t type;
 };
 
-struct ReapMemoryRequest : ReapRequest
+struct ReapErrorReport : ReapPacketHeader
+{
+    ReapErrorReport() {
+        this->type = OperationType_t::ERRORREPORT;
+    }
+    OperationType_t errorType;
+    uint8_t errorStringLen;
+    char errorString[64];
+};
+
+struct ReapMemoryRequest : ReapPacketHeader
 {
     uint64_t startAddr;
     uint64_t endAddr;
@@ -24,17 +53,26 @@ struct ReapMemoryRequest : ReapRequest
 };
 
 struct ReapWriteRequest : ReapMemoryRequest
-{};
+{
+    ReapWriteRequest() {
+        this->type = OperationType_t::WRITEPROCESSMEMORY;
+    }
+};
 
 struct ReapReadRequest : ReapMemoryRequest
 {
-    char buffer[65535]; // should be dynamic, make sure this is at the end and we'll just cut if off
+    char buffer[65536]; // should be dynamic, make sure this is at the end and we'll just cut if off
 };
 
 
 // Process Setup
-struct ReapOpenProcessRequest : ReapRequest
+struct ReapOpenProcessRequest : ReapPacketHeader
 {
-    const char moduleName[64];
-    const char processName[16]; // gets cut off
+    char processName[16]; // gets cut off
+};
+
+// The biggest possible.
+struct ReapRequestGeneric : ReapReadRequest
+{
+
 };

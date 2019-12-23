@@ -37,7 +37,7 @@ void Logger::Log( const char *format, ... ) {
     vsnprintf(buffer, 4096, format, args);
     fprintf(logFile, buffer);
     va_end(args);
-    fflush(logFile);
+    //fflush(logFile);
 #if (LMODE() != MODE_EXTERNAL())
     fclose(logFile);
 #endif
