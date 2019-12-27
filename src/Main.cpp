@@ -124,7 +124,15 @@ static void* NewConnection( void *raw_NewSock ){
 
     ReapRequestGeneric request;
     ReapRequestGeneric response;
+
     ReapOpenProcessRequest *openProcess;
+
+    ReapReadRequest const *readRequest;
+    ReapReadRequest readResponse = ReapReadRequest();
+
+    ReapWriteRequest const *writeRequest;
+    ReapWriteRequest writeResponse = ReapWriteRequest();
+
     ReapErrorReport error = ReapErrorReport();
 
     WinProcess *process = nullptr;
@@ -135,17 +143,15 @@ static void* NewConnection( void *raw_NewSock ){
         if( r < 0 ){
             Logger::Log("Error receiving on open sock!(%d)\n", sock); // can happen when client alt-f4's
             break;
-        } else if( r < sizeof(ReapPacketHeader) || ( strcmp( request.magic, "reap" ) != 0 ) ){
+        } else if( r < sizeof(ReapPacketHeader) || ( strcmp( (const char*)request.magic, "reap" ) != 0 ) ){
             Logger::Log("Invalid pkt header!(%d)\n", sock);
-            r = snprintf( error.errorString, sizeof(error.errorString), "Invalid packet header.");
-            error.errorStringLen = r;
+            snprintf( error.errorString, sizeof(error.errorString), "Invalid packet header.");
             error.errorType = OperationType_t::PING;
             send( sock, &error, sizeof( ReapErrorReport ), 0 );
             continue;
         } else if( request.version != REAP_VERSION ){
             Logger::Log("Client version mismatch!(%d)\n", sock);
-            r = snprintf( error.errorString, sizeof(error.errorString), "Version Mismatch, please update.");
-            error.errorStringLen = r;
+            snprintf( error.errorString, sizeof(error.errorString), "Version Mismatch, please update.");
             error.errorType = OperationType_t::PING;
             send( sock, &error, sizeof( ReapErrorReport ), 0 );
             continue;
@@ -154,7 +160,7 @@ static void* NewConnection( void *raw_NewSock ){
                 case OperationType_t::PING:
                     Logger::Log("Received ping packet. Responding...\n");
                     response.type = OperationType_t::PING;
-                    r = send( sock, &response, sizeof(ReapPacketHeader), 0 );
+                    send( sock, &response, sizeof(ReapPacketHeader), 0 );
                     break;
                 case OperationType_t::OPENPROCESS:
                     process = nullptr;
@@ -170,8 +176,7 @@ static void* NewConnection( void *raw_NewSock ){
                         }
                     }
                     if( !process ){
-                        r = snprintf( error.errorString, sizeof(error.errorString), "Failed to find your process." );
-                        error.errorStringLen = r;
+                        snprintf( error.errorString, sizeof(error.errorString), "Failed to find your process." );
                         error.errorType = OperationType_t::OPENPROCESS;
                         send( sock, &error, sizeof(ReapErrorReport), 0 );
                     } else {
@@ -183,23 +188,67 @@ static void* NewConnection( void *raw_NewSock ){
                     break;
                 case OperationType_t::READPROCESSMEMORY:
                     if( !process ){
-                        r = snprintf( error.errorString, sizeof(error.errorString), "You need to Open Process before you can read/write!");
-                        error.errorStringLen = r;
+                        snprintf( error.errorString, sizeof(error.errorString), "You need to Open Process before you can read/write!");
                         error.errorType = OperationType_t::READPROCESSMEMORY;
                         send( sock, &error, sizeof(ReapErrorReport), 0 );
+                        break;
                     }
+                    readRequest = (ReapReadRequest*)&request;
+
+                    Logger::Log("Reading start(%p) - bytes(0x%x)\n", readRequest->startAddr, readRequest->totalBytesManipulated);
+
+                    r = process->Read( readRequest->startAddr, &readResponse.buffer, readRequest->totalBytesManipulated );
+                    for( uint32_t i = 0; i < readRequest->totalBytesManipulated; i ++ ){
+                        Logger::Log("%x - ", readResponse.buffer[i]);
+                    }
+                    Logger::Log("\nRaw read Send(%p)\n", (void*)&readResponse);
+                    //std::raise(SIGINT);
+                    if( r < 0 ){
+                        Logger::Log("Failed to read memory!\n");
+                        snprintf( error.errorString, sizeof(error.errorString), "Failed to read memory." );
+                        error.errorType = OperationType_t::READPROCESSMEMORY;
+                        send( sock, &error, sizeof(ReapErrorReport), 0 );
+                        break;
+                    }
+
+                    readResponse.startAddr = readRequest->startAddr;
+                    readResponse.type = OperationType_t::READPROCESSMEMORY;
+                    readResponse.totalBytesManipulated = (uint32_t)r;
+                    send( sock, &readResponse, (sizeof(ReapMemoryRequest) + r), 0 );
+
                     break;
                 case OperationType_t::WRITEPROCESSMEMORY:
                     if( !process ){
-                        r = snprintf( error.errorString, sizeof(error.errorString), "You need to Open Process before you can read/write!");
-                        error.errorStringLen = r;
+                        snprintf( error.errorString, sizeof(error.errorString), "You need to Open Process before you can read/write!");
                         error.errorType = OperationType_t::WRITEPROCESSMEMORY;
                         send( sock, &error, sizeof(ReapErrorReport), 0 );
+                        break;
+                    }
+                    writeRequest = (ReapWriteRequest*)&request;
+
+                    Logger::Log("Writing start(%p) - bytes(%x)\n", writeRequest->startAddr, writeRequest->totalBytesManipulated);
+                    for( uint32_t i = 0; i < writeRequest->totalBytesManipulated; i++ ){
+                        Logger::Log("%x - ", writeRequest->buffer[i]);
+                    }
+                    Logger::Log("\n");
+                    r = process->Write( writeRequest->startAddr, (void*)writeRequest->buffer, writeRequest->totalBytesManipulated );
+                    if( r < 0 ){
+                        snprintf( error.errorString, sizeof(error.errorString), "Failed to Write Memory." );
+                        error.errorType = OperationType_t::WRITEPROCESSMEMORY;
+                        send( sock, &error, sizeof(ReapErrorReport), 0 );
+                        break;
                     }
 
+                    writeResponse.startAddr = writeRequest->startAddr;
+                    writeResponse.type = OperationType_t::WRITEPROCESSMEMORY;
+                    writeResponse.totalBytesManipulated = (uint32_t)r;
+
+                    send( sock, &writeResponse, sizeof(ReapMemoryRequest), 0 );
                     break;
                 default:
-                    /// Send back invalid packet
+                    error.errorType = OperationType_t::PING;
+                    snprintf( error.errorString, sizeof(error.errorString), "Unknown Request Type.");
+                    send( sock, &error, sizeof(ReapErrorReport), 0 );
                     break;
             }
         }
